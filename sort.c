@@ -33,24 +33,19 @@
 
 #define SHM_NAME "/sharemem"
 #define QUEUE_NAME "/queue01"
-#define SEM_TASKS_NAME "/sem01"
-#define SEM_LECTURA_NAME "/sem02"
-
 
 /* Shared memory */
 Sort* sort = NULL;
 
-
-
 /* FLAGS FOR HANDLERS*/
-short flag_term = 0;
-short flag_usr = 0;
+volatile sig_atomic_t flag_term = 0;
+volatile sig_atomic_t flag_usr = 0;
 
 /*GLOBAL VARIABLES FOR WORKERS*/
 int pipewriteworker, pipereadworker;
 Job* actualjob;
 
-
+/* Signal handlers */
 void SIGTERM_handler(int sig) {
    flag_term = 1;
 }
@@ -62,6 +57,7 @@ void SIGUSR1_handler(int sig) {
 void SIGALRM_handler(int sig) {
     Job incasenull;
     int returnfromil=-1;
+    
     if(actualjob == NULL){
         incasenull.level = -1;
         incasenull.part = -1;
@@ -92,9 +88,12 @@ void SIGALRM_handler(int sig) {
 
 void SIGINT_handler(int sig){
     int j, counter=0;
+    
+    /* Send SIGTERM to all child processes */
     for (j = 0; sort->pids[j] != -1; j++, counter++) 
         kill(sort->pids[j], SIGTERM); 
     
+    /* Wait for all children to terminate */
     while(1){
         if(wait(NULL) == -1){
             if(errno !=  ECHILD){
@@ -107,6 +106,7 @@ void SIGINT_handler(int sig){
     exit(EXIT_SUCCESS);
 }
 
+/* Sorting algorithms */
 Status bubble_sort(int *vector, int n_elements, int delay) {
     int i, j;
     int temp;
@@ -177,11 +177,13 @@ int get_number_parts(int level, int n_levels) {
     return 1 << (n_levels - 1 - level);
 }
 
+/* Task management functions */
 Status init_sort(char *file_name, Sort *sort, int n_levels, int n_processes, int delay) {
     char string[MAX_STRING];
     FILE *file = NULL;
     int i, j, log_data;
     int block_size, modulus;
+    
     sort->pids[0] = -1;
     
 
@@ -197,6 +199,7 @@ Status init_sort(char *file_name, Sort *sort, int n_levels, int n_processes, int
     /* The main process PID is stored. */
     sort->ppid = getpid();
     /* Delay for the algorithm in ns (less than 1s). */
+    // TODO I should remove this line already or it will not compile
     sort->delay = MAX(1, MIN(999999999, delay));
 
     if (!(file = fopen(file_name, "r"))) {
@@ -289,6 +292,7 @@ Status send_task(int level, int part){
     Job sendtask;
     sendtask.level = level;
     sendtask.part = part;
+    
     while (mq_send(sort->queue, (char*)&sendtask, sizeof(Task), 1) == -1) {
         if(errno == EINTR){
             continue;
@@ -296,6 +300,7 @@ Status send_task(int level, int part){
         perror("Error sending message");
         return ERROR;
     }
+    
     sem_wait(&(sort->mutextasks));
     (sort->tasks[level][part]).completed = SENT;
     sem_post(&(sort->mutextasks));
@@ -320,25 +325,25 @@ Status  solve_task(Task* task) {
     }
 }
 
-
-
-
-
-
 /*INITIALIZATION AND CLEANING*/
 Status init_shared_memory(){
     int shared_fd, ret;
-    shared_fd = shm_open(SHM_NAME, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    
+    shared_fd = shm_open(SHM_NAME, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
     if (shared_fd == -1) {
-        perror("Creating shared memory");
-        close(shared_fd);
-        return ERROR;
+        if (errno == EEXIST) {
+            /* Shared memory already exists, try to open it */
+            shared_fd = shm_open(SHM_NAME, O_RDWR, S_IRUSR | S_IWUSR);
+            if (shared_fd == -1) {
+                perror("Opening existing shared memory");
+                return ERROR;
+            }
+        } else {
+            perror("Creating shared memory");
+            return ERROR;
+        }
     }
-    ret = shm_unlink(SHM_NAME);
-    if (ret == -1) {
-        perror("Unlinking shared memory");
-        return ERROR;
-    }
+    
     ret = ftruncate(shared_fd, sizeof(Sort));
     if (ret == -1) {
         perror("Truncating shared memory");
@@ -356,10 +361,6 @@ Status init_shared_memory(){
         return ERROR;
     }
     close(shared_fd);
-
-
-
-
 
     if(sem_init(&(sort->mutextasks), 1, 1) == -1){
         perror("sem_init failed");
@@ -390,22 +391,28 @@ Status init_pipes(int* pipes){
 
 Status init_queue(){
     struct mq_attr attributes;
-    attributes.mq_flags = 0,
-    attributes.mq_maxmsg = 10,
-    attributes.mq_curmsgs = 0,
+    attributes.mq_flags = 0;
+    attributes.mq_maxmsg = 10;
+    attributes.mq_curmsgs = 0;
     attributes.mq_msgsize = sizeof(Task);
+    
     sort->queue = mq_open(QUEUE_NAME,
-        O_CREAT | O_RDWR, 
+        O_CREAT | O_RDWR | O_EXCL, 
         S_IRUSR | S_IWUSR, 
         &attributes);
     if (sort->queue == -1) {
-        perror("Opening queue");
-        mq_unlink(QUEUE_NAME);
-        munmap(sort, sizeof(*sort));
-        sem_destroy(&(sort->mutextasks));
-        return ERROR;
+        if (errno == EEXIST) {
+            /* Queue already exists, try to open it */
+            sort->queue = mq_open(QUEUE_NAME, O_RDWR, S_IRUSR | S_IWUSR);
+            if (sort->queue == -1) {
+                perror("Opening existing queue");
+                return ERROR;
+            }
+        } else {
+            perror("Opening queue");
+            return ERROR;
+        }
     }
-    mq_unlink(QUEUE_NAME);
     return OK;
 }
 
@@ -434,7 +441,7 @@ Status init_handlers(){
     actcancel.sa_flags = 0;
     actcancel.sa_handler = SIGINT_handler;
     if (sigaction(SIGINT, &actcancel, NULL) < 0) {
-        perror("sigaction SIGUSR1");
+        perror("sigaction SIGINT");
         injector_clean();
         return ERROR;
     }
@@ -443,7 +450,7 @@ Status init_handlers(){
     actarlm.sa_flags = 0;
     actarlm.sa_handler = SIGALRM_handler;
     if (sigaction(SIGALRM, &actarlm, NULL) < 0) {
-        perror("sigaction SIGUSR1");
+        perror("sigaction SIGALRM");
         injector_clean();
         return ERROR;
     }
@@ -451,35 +458,48 @@ Status init_handlers(){
 }
 
 void injector_clean(){
-    mq_close(sort->queue);
-    sem_destroy(&(sort->mutextasks));
-    munmap(sort, sizeof(*sort));
+    if (sort) {
+        if (sort->queue != -1) {
+            mq_close(sort->queue);
+        }
+        sem_destroy(&(sort->mutextasks));
+        munmap(sort, sizeof(*sort));
+    }
+    /* Clean up shared memory and queue */
+    shm_unlink(SHM_NAME);
+    mq_unlink(QUEUE_NAME);
 }
 
 void worker_clean(char* myTask){
-        mq_close(sort->queue);
+    if (sort) {
+        if (sort->queue != -1) {
+            mq_close(sort->queue);
+        }
         munmap(sort, sizeof(*sort));
-        free(myTask);
+    }
+    free(myTask);
 }
 
 void ignore_SIGINT(){
     struct sigaction actwork;
     sigemptyset(&(actwork.sa_mask));
-        actwork.sa_flags = 0;
-        actwork.sa_handler = SIG_IGN;
-        if (sigaction(SIGINT, &actwork, NULL) < 0)
-            perror("sigaction SIGTERM");
+    actwork.sa_flags = 0;
+    actwork.sa_handler = SIG_IGN;
+    if (sigaction(SIGINT, &actwork, NULL) < 0) {
+        perror("sigaction SIGINT");
+    }
 }
-
-
 
 /*SENDING TASKS*/
 Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int delay) {
-    int i, j;  short flag_completed = 0;
+    int i, j;  
+    short flag_completed = 0;
     sigset_t nowset, oldset, empty;    
     int pipes[MAX_PARTS*4]; /*for each worker 4 pipes worker_side|ilustrator_side     first direction ilustrator second direction worker*/
-    sigemptyset(&empty);  sigemptyset(&oldset); sigemptyset(&nowset);
-
+    
+    sigemptyset(&empty);  
+    sigemptyset(&oldset); 
+    sigemptyset(&nowset);
 
     if(init_shared_memory() == ERROR) return ERROR; /* cleaning handled inside*/
     if (init_sort(file_name, sort, n_levels, n_processes, delay) == ERROR) { /* The data is loaded and the structure initialized. */
@@ -490,11 +510,9 @@ Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int
     if(init_pipes(pipes) == ERROR) return ERROR;
     if(init_handlers() == ERROR) return ERROR;
     
-
-
-
     printf("\nStarting algorithm with %d levels and %d processes...\n", sort->n_levels, sort->n_processes);
 
+    /* Fork illustrator process */
     sort->pids[0] = fork();
     if(sort->pids[0] == -1){
         perror("forking ilustrator");
@@ -506,11 +524,7 @@ Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int
         exit(EXIT_FAILURE);
     }
     
-
-    
-    
-
-    
+    /* Fork worker processes */
     for (j = 1; j < n_processes+1; j++) {
         sort->pids[j] = fork();       
 
@@ -532,16 +546,26 @@ Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int
     }
 
     sigaddset(&nowset, SIGUSR1);
-
     
-    /*sending first batch of tasks*/
-    if (sigprocmask(SIG_BLOCK, &nowset, &oldset) < 0) { injector_clean(); exit(EXIT_FAILURE); }
-    for (j = 0; j < get_number_parts(0, sort->n_levels); j++) 
-        if(send_task(0, j) == ERROR){ injector_clean(); exit(EXIT_FAILURE);   }
-    if (sigprocmask(SIG_SETMASK, &oldset, NULL) < 0) injector_clean();
+    /* Send first batch of tasks */
+    if (sigprocmask(SIG_BLOCK, &nowset, &oldset) < 0) { 
+        injector_clean(); 
+        exit(EXIT_FAILURE); 
+    }
     
+    for (j = 0; j < get_number_parts(0, sort->n_levels); j++) {
+        if(send_task(0, j) == ERROR){ 
+            injector_clean(); 
+            exit(EXIT_FAILURE);   
+        }
+    }
     
-    /*wait for the workers to answer*/
+    if (sigprocmask(SIG_SETMASK, &oldset, NULL) < 0) {
+        injector_clean();
+        exit(EXIT_FAILURE);
+    }
+    
+    /* Wait for the workers to answer */
     while(1){
         if(flag_usr == 1){
             flag_usr = 0;
@@ -551,7 +575,9 @@ Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int
             for(i=0; i<sort->n_levels; i++){
                 for(j=0; j<get_number_parts(i, sort->n_levels); j++){
                     if(sort->tasks[i][j].completed == INCOMPLETE){
-                        if(check_task_ready(sort, i, j) == TRUE) send_task(i, j);
+                        if(check_task_ready(sort, i, j) == TRUE) {
+                            send_task(i, j);
+                        }
                         flag_completed = 0;
                     }
                     else if(sort->tasks[i][j].completed == COMPLETED) continue; 
@@ -564,20 +590,21 @@ Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int
         }     
 
         sigsuspend(&empty); 
-
-        
-        
     }
 
-       
-    
-
-    for (j = 0; j < n_processes+1; j++) 
+    /* Terminate all child processes */
+    for (j = 0; j < n_processes+1; j++) {
         kill(sort->pids[j], SIGTERM);
+    }
 
-    for (j = 0; j < n_processes+1; j++) 
-        if(wait(NULL) == -1)
-            if(errno != EINTR) perror("error waiting for workers");
+    /* Wait for all children to terminate */
+    for (j = 0; j < n_processes+1; j++) {
+        if(wait(NULL) == -1) {
+            if(errno != EINTR) {
+                perror("error waiting for workers");
+            }
+        }
+    }
 
     plot_vector(sort->data, sort->n_elements);
     printf("\nAlgorithm completed\n");
@@ -585,18 +612,24 @@ Status sort_multiple_process(char *file_name, int n_levels, int n_processes, int
     return OK;
 }
 
-
-
 /*EACH PROCESS FUNCTION*/
 Status worker(){
     char* buffer;
     Job*  received;
     Task* perform;
+    
     buffer = (char*) malloc(sizeof(Task));
+    if (buffer == NULL) {
+        perror("malloc failed in worker");
+        exit(EXIT_FAILURE);
+    }
+    
     actualjob = NULL;
     alarm(1);
+    
     while(1){
         if(flag_term == 1) break;
+        
         while (mq_receive(sort->queue, buffer, sizeof(Task), NULL) == -1) {
             if(errno == EINTR){
                 if(flag_term == 1) break;
@@ -604,7 +637,6 @@ Status worker(){
             }
             else {
                 perror("Error receiving message");
-                
                 worker_clean(buffer);
                 kill(getppid(), SIGUSR1);                    
                 exit(EXIT_FAILURE);
@@ -615,9 +647,6 @@ Status worker(){
         perform = &(sort->tasks[received->level][received->part]);
         actualjob = received;
 
-      
-
-
         if(solve_task(perform) == ERROR){
             sem_wait(&(sort->mutextasks));
             (perform)->completed = INCOMPLETE;
@@ -627,10 +656,7 @@ Status worker(){
             exit(EXIT_FAILURE);
         }
         
-
-
         (perform)->completed = COMPLETED;
-
        
         if(flag_term == 1) break;
         kill(getppid(), SIGUSR1);
@@ -641,19 +667,20 @@ Status worker(){
     exit(EXIT_SUCCESS);
 }
 
-
-
 /*ILUSTRATOR*/
 void ilustrador(int *pipes){
     int i = 0, j=0;
-    int counter = 0; /*couynts the inactive processes*/
+    int counter = 0; /*counts the inactive processes*/
     int send = 0;
     Job receiver[MAX_PARTS];
+   
    /*pipe[worker_id * 4 + 0] -> illustrator reads
      pipe[worker_id * 4 + 1] -> worker      writes
      pipe[worker_id * 4 + 2] -> worker      reads
      pipe[worker_id * 4 + 3] -> illustrator writes
     */
+    
+    /* Close unused pipe ends */
     for(i=0; i<sort->n_processes; i++){
         close(pipes[i*4 +1]);
         close(pipes[i*4 +2]);
@@ -661,6 +688,8 @@ void ilustrador(int *pipes){
 
     while(1){
         counter= 0;
+        
+        /* Receive state from all workers */
         for(i=0; i<sort->n_processes; i++){
             if (read(pipes[i*4 + 0], &(receiver[i]), sizeof(Job)) == -1) {
                 if(errno == EINTR){
@@ -673,18 +702,18 @@ void ilustrador(int *pipes){
         
         plot_vector(sort->data, sort->n_elements);
         
-        
         printf("\n\n Process data: ");
         for(i=0; i<sort->n_processes; i++){
             if(receiver[i].level == -1){
                 counter++;
             }
-            else {printf("Process State: %i, %i | ", receiver[i].level, receiver[i].part);}
+            else {
+                printf("Process State: %i, %i | ", receiver[i].level, receiver[i].part);
+            }
         }
 
         printf("Inactive processes: %d\n", counter);
         
-
         printf("\n\n TASKS STATE:\n");
         for(i=0; i<sort->n_levels; i++){
             for(j=0; j<get_number_parts(i, sort->n_levels); j++){
@@ -693,21 +722,21 @@ void ilustrador(int *pipes){
             printf("\n");
         }
 
+        /* Send response to all workers */
         for(i=0; i<sort->n_processes; i++){
             if (write(pipes[i*4 + 3], &send, sizeof(int)) == -1) {
                 perror("error writing response ilustrator");
                 break;
             }
         }
+        
         if(flag_term == 1) break;
-
     }
 
+    /* Cleanup */
     for(i=0; i<sort->n_processes; i++){
         close(pipes[i*4 +0]);
         close(pipes[i*4 +3]);
     }
     exit(EXIT_SUCCESS);
-
-        
 }
