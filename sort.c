@@ -199,6 +199,7 @@ Status init_sort(char *file_name, Sort *sort, int n_levels, int n_processes, int
     /* The main process PID is stored. */
     sort->ppid = getpid();
     /* Delay for the algorithm in ns (less than 1s). */
+    // TODO I should remove this line already or it will not compile
     sort->delay = MAX(1, MIN(999999999, delay));
 
     if (!(file = fopen(file_name, "r"))) {
